@@ -1,0 +1,13 @@
+{
+  "name": "build-github-action-near-testnet-deploy",
+  "version": "1.0.0",
+  "description": "Build GitHub Action: NEAR Testnet Deploy",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "echo ok"
+  },
+  "dependencies": {
+    "@actions/core": "^1.10.0",
+    "@actions/github": "^6.0.0"
+  }
+}
