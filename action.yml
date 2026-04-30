@@ -2,30 +2,30 @@ name: "Build GitHub Action: NEAR Testnet Deploy"
 description: "## Overview Create a GitHub Action specifically for deploying to NEAR testnet with automatic faucet funding and test exe"
 
 inputs:
-  contract_path:
-    description: "Path to the contract directory or WASM file to deploy"
-    required: true
-    default: ''
-  testnet_account_id:
+  near_account_id:
     description: "NEAR testnet account ID for deployment"
     required: true
     default: ''
-  testnet_private_key:
-    description: "Private key for testnet account authentication"
+  contract_path:
+    description: "Path to the contract binary or source code to deploy"
     required: true
     default: ''
-  faucet_request_amount:
-    description: "Amount of NEAR tokens to request from faucet in case of insufficient balance"
+  private_key:
+    description: "Private key for the NEAR testnet account (stored as secret)"
+    required: true
+    default: ''
+  faucet_funding:
+    description: "Amount of NEAR tokens to request from faucet (in NEAR)"
     required: false
     default: '10'
   run_tests:
     description: "Whether to execute smoke tests after deployment"
     required: false
     default: 'true'
-  test_script_path:
-    description: "Path to test script or command to run for smoke tests"
+  test_command:
+    description: "Command to run for smoke tests"
     required: false
-    default: ''
+    default: 'npm test'
 
 outputs:
   result:
@@ -48,9 +48,9 @@ runs:
       id: run
       run: cd ${{ github.action_path }} && node src/index.js
       env:
+        INPUT_NEAR_ACCOUNT_ID: ${{ inputs.near_account_id }}
         INPUT_CONTRACT_PATH: ${{ inputs.contract_path }}
-        INPUT_TESTNET_ACCOUNT_ID: ${{ inputs.testnet_account_id }}
-        INPUT_TESTNET_PRIVATE_KEY: ${{ inputs.testnet_private_key }}
-        INPUT_FAUCET_REQUEST_AMOUNT: ${{ inputs.faucet_request_amount }}
+        INPUT_PRIVATE_KEY: ${{ inputs.private_key }}
+        INPUT_FAUCET_FUNDING: ${{ inputs.faucet_funding }}
         INPUT_RUN_TESTS: ${{ inputs.run_tests }}
-        INPUT_TEST_SCRIPT_PATH: ${{ inputs.test_script_path }}
+        INPUT_TEST_COMMAND: ${{ inputs.test_command }}
