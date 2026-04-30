@@ -1,36 +1,35 @@
 # NEAR Testnet Deploy
 
-Automatically deploy smart contracts to NEAR testnet with account creation, faucet funding, and smoke test execution in a single GitHub Action step.
+GitHub Action for deploying smart contracts to NEAR testnet with automatic account creation, faucet funding, and smoke test execution.
 
 ## Description
 
-This action handles the complete NEAR testnet deployment workflow. It creates a testnet account if one does not exist, requests faucet funding, deploys your contract, runs basic smoke tests, and reports the results back to your workflow.
+Handles the complete NEAR testnet deployment workflow in a single step. Automatically creates a testnet account if one does not exist, requests faucet funding, deploys your contract, runs basic smoke tests, and reports results back to your workflow.
 
 ## Inputs
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `account-id` | Yes | — | NEAR testnet account ID to deploy to |
+| `account-id` | Yes | — | NEAR testnet account ID (e.g. `myapp.testnet`) |
 | `contract-path` | Yes | — | Path to the compiled `.wasm` contract file |
 | `private-key` | Yes | — | Private key for the testnet account |
-| `run-smoke-tests` | No | `true` | Run basic smoke tests after deployment |
-| `smoke-test-methods` | No | — | Comma-separated list of view methods to call |
-| `faucet-url` | No | `https://helper.testnet.near.org` | Custom faucet endpoint URL |
+| `run-smoke-tests` | No | `true` | Execute basic smoke tests after deploy |
+| `network` | No | `testnet` | NEAR network RPC endpoint alias |
 
 ## Outputs
 
 | Output | Description |
 |--------|-------------|
-| `account-id` | The testnet account ID used for deployment |
+| `account-id` | The testnet account used for deployment |
 | `contract-hash` | SHA256 hash of the deployed contract |
-| `deployment-tx` | Transaction hash of the deployment |
-| `smoke-test-status` | Result of smoke tests: `passed`, `failed`, or `skipped` |
-| `account-balance` | Remaining account balance after deployment in NEAR |
+| `faucet-funded` | `true` if faucet funding was requested |
+| `smoke-tests-passed` | `true` if all smoke tests passed |
+| `deploy-tx-id` | Transaction ID of the deployment |
 
 ## Usage
 
 jobs:
-  deploy:
+  deploy-testnet:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,4 +44,9 @@ jobs:
           contract-path: target/wasm32-unknown-unknown/release/contract.wasm
           private-key: ${{ secrets.NEAR_TESTNET_PRIVATE_KEY }}
           run-smoke-tests: true
-          smoke-test-methods: get_status,get_owner
+
+## Notes
+
+- Faucet funding is skipped if the account balance exceeds 10 NEAR
+- Smoke tests call `version` and `status` view methods by default
+- Store `private-key` as an encrypted repository secret
