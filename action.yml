@@ -3,7 +3,7 @@ description: "## Overview Create a GitHub Action specifically for deploying to N
 
 inputs:
   contract_path:
-    description: "Path to the NEAR contract source code directory"
+    description: "Path to the contract source code or compiled WASM file"
     required: true
     default: ''
   testnet_account_id:
@@ -11,21 +11,21 @@ inputs:
     required: true
     default: ''
   near_private_key:
-    description: "Private key for NEAR testnet account authentication"
+    description: "Private key for testnet account authentication"
     required: true
     default: ''
   faucet_enabled:
     description: "Enable automatic faucet funding for testnet account"
     required: false
     default: 'true'
-  run_tests:
-    description: "Execute smoke tests after deployment"
+  smoke_tests_enabled:
+    description: "Run basic smoke tests after contract deployment"
     required: false
     default: 'true'
   test_script_path:
-    description: "Path to test script to run after deployment"
+    description: "Path to custom test script to execute post-deployment"
     required: false
-    default: 'tests/smoke-test.js'
+    default: ''
 
 outputs:
   result:
@@ -52,5 +52,5 @@ runs:
         INPUT_TESTNET_ACCOUNT_ID: ${{ inputs.testnet_account_id }}
         INPUT_NEAR_PRIVATE_KEY: ${{ inputs.near_private_key }}
         INPUT_FAUCET_ENABLED: ${{ inputs.faucet_enabled }}
-        INPUT_RUN_TESTS: ${{ inputs.run_tests }}
+        INPUT_SMOKE_TESTS_ENABLED: ${{ inputs.smoke_tests_enabled }}
         INPUT_TEST_SCRIPT_PATH: ${{ inputs.test_script_path }}
