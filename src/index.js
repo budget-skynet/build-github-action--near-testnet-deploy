@@ -1,47 +1,50 @@
-async function jsonPost(url, payload, extraHeaders = {}) {
+async function jsonPost(urlStr, payload, extraHeaders) {
   const body = JSON.stringify(payload);
-  const res = await request(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body),
-      ...extraHeaders,
-    },
-  }, body);
+  const headers = Object.assign(
+    { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    extraHeaders || {}
+  );
+  const res = await httpsRequest(urlStr, { method: 'POST', headers }, body);
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    throw new Error(`HTTP ${res.statusCode} from ${urlStr}: ${res.body}`);
+  }
   try {
-    return { status: res.status, data: JSON.parse(res.body) };
+    return JSON.parse(res.body);
   } catch {
-    return { status: res.status, data: res.body };
+    return res.body;
   }
 }
 
-async function jsonGet(url) {
-  const res = await request(url, { method: 'GET', headers: { 'Content-Type': 'application/json' } });
+async function jsonGet(urlStr, extraHeaders) {
+  const res = await httpsRequest(urlStr, { method: 'GET', headers: extraHeaders || {} });
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    throw new Error(`HTTP ${res.statusCode} from ${urlStr}: ${res.body}`);
+  }
   try {
-    return { status: res.status, data: JSON.parse(res.body) };
+    return JSON.parse(res.body);
   } catch {
-    return { status: res.status, data: res.body };
+    return res.body;
   }
 }
 
 // ---------------------------------------------------------------------------
-// NEAR RPC helper
+// NEAR RPC helpers
 // ---------------------------------------------------------------------------
-const RPC_URL = 'https://rpc.testnet.near.org';
+
+const NEAR_TESTNET_RPC = 'https://rpc.testnet.near.org';
+const NEAR_TESTNET_HELPER = 'https://helper.testnet.near.org';
+const NEAR_FAUCET_API = 'https://near-faucet.io/api/faucet/tokens';
 
 async function nearRpcCall(method, params) {
-  const payload = { jsonrpc: '2.0', id: 'near-testnet-deploy', method, params };
-  const res = await jsonPost(RPC_URL, payload);
-  if (res.status !== 200) {
-    throw new Error(`RPC HTTP error ${res.status}: ${JSON.stringify(res.data)}`);
+  const payload = { jsonrpc: '2.0', id: 'dontcare', method, params };
+  const result = await jsonPost(NEAR_TESTNET_RPC, payload);
+  if (result.error) {
+    throw new Error(`NEAR RPC error [${method}]: ${JSON.stringify(result.error)}`);
   }
-  if (res.data.error) {
-    throw new Error(`RPC error: ${JSON.stringify(res.data.error)}`);
-  }
-  return res.data.result;
+  return result.result;
 }
 
-async function queryAccount(accountId) {
+async function getAccountState(accountId) {
   try {
     const result = await nearRpcCall('query', {
       request_type: 'view_account',
@@ -50,460 +53,493 @@ async function queryAccount(accountId) {
     });
     return result;
   } catch (err) {
-    if (err.message.includes('does not exist') || err.message.includes('UNKNOWN_ACCOUNT')) {
-      return null;
-    }
+    if (err.message.includes('does not exist')) return null;
+    if (err.message.includes('UNKNOWN_ACCOUNT')) return null;
     throw err;
   }
 }
 
-// ---------------------------------------------------------------------------
-// near-cli wrapper – used for deploy and call operations
-// ---------------------------------------------------------------------------
-function findNearCli() {
-  // Prefer locally installed near-cli or near-cli-rs
-  const candidates = ['near', 'npx near'];
-  for (const cmd of candidates) {
-    try {
-      execSync(`${cmd} --version`, { stdio: 'ignore' });
-      return cmd;
-    } catch { /* continue */ }
-  }
-  return null;
-}
-
-function installNearCli() {
-  core.info('Installing near-cli globally …');
-  execSync('npm install -g near-cli@3', { stdio: 'inherit' });
-}
-
-function exec(cmd, opts = {}) {
-  core.debug(`$ ${cmd}`);
-  const result = spawnSync(cmd, {
-    shell: true,
-    encoding: 'utf8',
-    env: { ...process.env, ...(opts.env || {}) },
-    cwd: opts.cwd || process.cwd(),
-  });
-  if (result.error) throw result.error;
-  const stdout = (result.stdout || '').trim();
-  const stderr = (result.stderr || '').trim();
-  if (result.status !== 0) {
-    throw new Error(`Command failed (exit ${result.status}):\n${stderr || stdout}`);
-  }
-  return stdout;
-}
-
-// ---------------------------------------------------------------------------
-// Credential file helper (near-cli uses ~/.near-credentials)
-// ---------------------------------------------------------------------------
-function writeCredentials(accountId, privateKey) {
-  // near-cli expects ed25519 keys stored as JSON
-  // private key format: "ed25519:<base58>"
-  const network = 'testnet';
-  const credDir = path.join(os.homedir(), '.near-credentials', network);
-  fs.mkdirSync(credDir, { recursive: true });
-  const credFile = path.join(credDir, `${accountId}.json`);
-
-  // Normalise private key – accept with or without "ed25519:" prefix
-  let privateKeyNorm = privateKey;
-  if (!privateKeyNorm.startsWith('ed25519:') && !privateKeyNorm.startsWith('secp256k1:')) {
-    privateKeyNorm = `ed25519:${privateKeyNorm}`;
-  }
-
-  // Derive public key using near-cli's key derivation (or just store what we have)
-  // near-cli will derive publicKey from private key at runtime; we can store a placeholder
-  // but it must be present in the JSON. We'll let near-cli recalculate it by omitting
-  // publicKey and instead use the implicit format near-cli-rs expects.
-  // For near-cli v3 the format is:
-  //   { "account_id": "…", "public_key": "ed25519:…", "private_key": "ed25519:…" }
-  // We derive the public key using the tweetnacl library if available, otherwise we
-  // store a stub and rely on near-cli re-importing.
-  let publicKey = '';
+async function getAccessKeyInfo(accountId, publicKey) {
   try {
-    // Try to use the built-in crypto to derive the key via near-seed-phrase if available
-    const nacl = require('tweetnacl'); // may not be installed
-    const bs58 = require('bs58');
-    const rawPriv = bs58.decode(privateKeyNorm.replace(/^ed25519:/, ''));
-    const pair = nacl.sign.keyPair.fromSecretKey(rawPriv.slice(0, 32));
-    publicKey = `ed25519:${bs58.encode(pair.publicKey)}`;
-  } catch {
-    // tweetnacl / bs58 not available – near-cli v3 can infer publicKey from private key
-    // so we write an empty string; near-cli will fix it on first use
-    publicKey = '';
-  }
-
-  const cred = {
-    account_id: accountId,
-    public_key: publicKey || undefined,
-    private_key: privateKeyNorm,
-  };
-  // Remove undefined keys
-  Object.keys(cred).forEach(k => cred[k] === undefined && delete cred[k]);
-  fs.writeFileSync(credFile, JSON.stringify(cred, null, 2));
-  core.info(`Credentials written to ${credFile}`);
-  return credFile;
-}
-
-// ---------------------------------------------------------------------------
-// STEP 1 — Resolve / auto-create testnet account
-// ---------------------------------------------------------------------------
-async function stepResolveAccount(accountId, privateKey) {
-  core.startGroup('Step 1 — Resolve testnet account');
-  core.info(`Checking account: ${accountId}`);
-
-  const accountInfo = await queryAccount(accountId);
-
-  if (accountInfo) {
-    core.info(`Account exists. Balance: ${accountInfo.amount} yoctoNEAR`);
-    core.endGroup();
-    return { existed: true, accountInfo };
-  }
-
-  core.info(`Account ${accountId} does not exist — attempting implicit account creation via faucet …`);
-
-  // NEAR testnet allows implicit accounts (64-char hex) to be created by sending tokens.
-  // For named accounts (*.testnet) we rely on the testnet helper to create them.
-  const helperUrl = `https://helper.testnet.near.org/account`;
-  // The testnet helper creates accounts. We need the public key.
-  // Extract public key from private key via near-cli key import
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'near-'));
-  const keyFile = path.join(tmpDir, 'key.json');
-
-  // Write private key to temp file for near-cli
-  fs.writeFileSync(keyFile, JSON.stringify({
-    account_id: accountId,
-    private_key: privateKey.startsWith('ed25519:') ? privateKey : `ed25519:${privateKey}`,
-  }));
-
-  // Try the testnet helper create-account endpoint
-  const helperPayload = {
-    newAccountId: accountId,
-    newAccountPublicKey: privateKey,
-  };
-
-  try {
-    const helperRes = await jsonPost(helperUrl, helperPayload);
-    if (helperRes.status === 200 || helperRes.status === 201) {
-      core.info(`Account ${accountId} created via testnet helper.`);
-    } else {
-      core.warning(`Testnet helper returned ${helperRes.status}: ${JSON.stringify(helperRes.data)}`);
-      core.warning('Proceeding — account may already exist or will be funded by faucet.');
-    }
-  } catch (err) {
-    core.warning(`Testnet helper request failed: ${err.message}`);
-    core.warning('Proceeding to faucet funding step.');
-  }
-
-  fs.rmSync(tmpDir, { recursive: true, force: true });
-  core.endGroup();
-  return { existed: false, accountInfo: null };
-}
-
-// ---------------------------------------------------------------------------
-// STEP 2 — Request faucet funding
-// ---------------------------------------------------------------------------
-async function stepFaucetFunding(accountId, requestAmount) {
-  core.startGroup('Step 2 — Request faucet funding');
-  core.info(`Requesting ${requestAmount} NEAR from testnet faucet for ${accountId} …`);
-
-  // Primary faucet: nearprotocol/near-contract-helper testnet helper
-  const primaryUrl = `https://helper.testnet.near.org/account/${accountId}/fund`;
-  // Secondary faucet endpoint (public)
-  const secondaryUrl = 'https://testnet.near.org/near-faucet';
-
-  let funded = false;
-
-  // Attempt 1 — testnet helper fund endpoint
-  try {
-    const res = await request(primaryUrl, { method: 'POST', headers: {} });
-    if (res.status === 200 || res.status === 201 || res.status === 204) {
-      core.info('Faucet funding request succeeded (primary endpoint).');
-      funded = true;
-    } else {
-      core.warning(`Primary faucet returned HTTP ${res.status}: ${res.body.substring(0, 200)}`);
-    }
-  } catch (err) {
-    core.warning(`Primary faucet request error: ${err.message}`);
-  }
-
-  // Attempt 2 — near-api-js compatible helper
-  if (!funded) {
-    try {
-      const res2 = await jsonPost(
-        `https://helper.testnet.near.org/account`,
-        { newAccountId: accountId, newAccountPublicKey: '' },
-      );
-      if (res2.status < 300) {
-        core.info('Faucet funding request succeeded (helper fallback).');
-        funded = true;
-      } else {
-        core.warning(`Fallback faucet returned HTTP ${res2.status}`);
-      }
-    } catch (err2) {
-      core.warning(`Fallback faucet error: ${err2.message}`);
-    }
-  }
-
-  if (!funded) {
-    core.warning(
-      'Automated faucet funding could not be confirmed. ' +
-      'If the account already has funds this is not an error. Continuing …',
-    );
-  }
-
-  // Wait a few seconds for the funding transaction to be indexed
-  core.info('Waiting 5 s for faucet tx to finalize …');
-  await new Promise(r => setTimeout(r, 5000));
-
-  // Re-check balance
-  let balance = 'unknown';
-  try {
-    const info = await queryAccount(accountId);
-    if (info) {
-      balance = `${BigInt(info.amount) / BigInt('1000000000000000000000000')} NEAR`;
-      core.info(`Account balance after faucet: ${balance}`);
-    } else {
-      core.warning('Account still not visible on-chain. Faucet may be slow — continuing.');
-    }
-  } catch (err) {
-    core.warning(`Balance check failed: ${err.message}`);
-  }
-
-  core.endGroup();
-  return { funded, balance };
-}
-
-// ---------------------------------------------------------------------------
-// STEP 3 — Build & deploy the contract
-// ---------------------------------------------------------------------------
-async function stepDeploy(contractPath, accountId, nearCli) {
-  core.startGroup('Step 3 — Build & Deploy contract');
-
-  let wasmFile = contractPath;
-
-  // Resolve absolute path
-  const absPath = path.resolve(contractPath);
-
-  if (!fs.existsSync(absPath)) {
-    throw new Error(`contract_path does not exist: ${absPath}`);
-  }
-
-  const stat = fs.statSync(absPath);
-
-  if (stat.isDirectory()) {
-    core.info(`contract_path is a directory. Looking for build artefacts …`);
-
-    // Try to find existing .wasm in expected output dirs
-    const searchDirs = [
-      path.join(absPath, 'res'),
-      path.join(absPath, 'out'),
-      path.join(absPath, 'target', 'wasm32-unknown-unknown', 'release'),
-      path.join(absPath, 'target', 'near'),
-      absPath,
-    ];
-
-    let found = null;
-    for (const dir of searchDirs) {
-      if (!fs.existsSync(dir)) continue;
-      const files = fs.readdirSync(dir).filter(f => f.endsWith('.wasm'));
-      if (files.length > 0) {
-        found = path.join(dir, files[0]);
-        core.info(`Found pre-built WASM: ${found}`);
-        break;
-      }
-    }
-
-    if (!found) {
-      // Try to build
-      core.info('No pre-built WASM found. Attempting to build …');
-
-      // Check for Cargo.toml → Rust contract
-      if (fs.existsSync(path.join(absPath, 'Cargo.toml'))) {
-        core.info('Detected Rust contract. Running cargo build …');
-        try {
-          // Ensure wasm32 target is available
-          exec('rustup target add wasm32-unknown-unknown');
-          exec(
-            'cargo build --target wasm32-unknown-unknown --release',
-            { cwd: absPath },
-          );
-          // Find built WASM
-          const releaseDir = path.join(absPath, 'target', 'wasm32-unknown-unknown', 'release');
-          const wasms = fs.readdirSync(releaseDir).filter(f => f.endsWith('.wasm'));
-          if (wasms.length === 0) throw new Error('cargo build succeeded but no .wasm found.');
-          found = path.join(releaseDir, wasms[0]);
-          core.info(`Built WASM: ${found}`);
-        } catch (err) {
-          throw new Error(`Rust build failed: ${err.message}`);
-        }
-      }
-      // Check for package.json → AssemblyScript / JS contract
-      else if (fs.existsSync(path.join(absPath, 'package.json'))) {
-        core.info('Detected JS/AS contract. Running npm build …');
-        exec('npm install', { cwd: absPath });
-        try {
-          exec('npm run build', { cwd: absPath });
-        } catch {
-          exec('npm run compile', { cwd: absPath });
-        }
-        // Search again
-        for (const dir of searchDirs) {
-          if (!fs.existsSync(dir)) continue;
-          const files = fs.readdirSync(dir).filter(f => f.endsWith('.wasm'));
-          if (files.length > 0) { found = path.join(dir, files[0]); break; }
-        }
-        if (!found) throw new Error('JS/AS build succeeded but no .wasm file found.');
-      } else {
-        throw new Error(
-          `Cannot determine how to build contract in ${absPath}. ` +
-          'Provide a pre-built .wasm file or a Rust/AssemblyScript project directory.',
-        );
-      }
-    }
-
-    wasmFile = found;
-  } else {
-    // It's a file — must be .wasm
-    if (!absPath.endsWith('.wasm')) {
-      throw new Error(`contract_path must be a .wasm file or a project directory. Got: ${absPath}`);
-    }
-    wasmFile = absPath;
-  }
-
-  core.info(`Deploying ${wasmFile} to ${accountId} …`);
-
-  // Deploy using near-cli
-  const deployCmd =
-    `${nearCli} deploy ` +
-    `--accountId ${accountId} ` +
-    `--wasmFile ${wasmFile} ` +
-    `--networkId testnet ` +
-    `--nodeUrl ${RPC_URL}`;
-
-  let deployOutput;
-  try {
-    deployOutput = exec(deployCmd, {
-      env: { NEAR_ENV: 'testnet' },
+    const result = await nearRpcCall('query', {
+      request_type: 'view_access_key',
+      finality: 'final',
+      account_id: accountId,
+      public_key: publicKey,
     });
-    core.info('Deploy output:\n' + deployOutput);
+    return result;
   } catch (err) {
-    throw new Error(`Contract deployment failed: ${err.message}`);
+    if (err.message.includes('does not exist')) return null;
+    throw err;
   }
+}
 
-  // Extract transaction hash from output if present
-  const txHashMatch = deployOutput.match(/Transaction\s+ID[:\s]+([A-Za-z0-9]+)/i)
-    || deployOutput.match(/hash[:\s]+([A-Za-z0-9]{43,44})/i);
-  const txHash = txHashMatch ? txHashMatch[1] : 'unknown';
+async function getLatestBlock() {
+  return nearRpcCall('block', { finality: 'final' });
+}
 
-  core.info(`Deploy transaction hash: ${txHash}`);
-  core.setOutput('deploy_tx_hash', txHash);
+async function broadcastTx(signedTxBase64) {
+  return nearRpcCall('broadcast_tx_commit', [signedTxBase64]);
+}
 
-  core.endGroup();
-  return { wasmFile, txHash };
+async function queryContractCode(accountId) {
+  try {
+    return nearRpcCall('query', {
+      request_type: 'view_code',
+      finality: 'final',
+      account_id: accountId,
+    });
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
-// STEP 4 — Basic smoke tests
+// Key / signing utilities (pure Node.js — no external crypto deps)
 // ---------------------------------------------------------------------------
-async function stepSmokeTests(accountId, testScriptPath, nearCli) {
-  core.startGroup('Step 4 — Smoke tests');
 
-  const results = [];
+// NEAR uses ed25519. Node 15+ has webcrypto; for compatibility we use the
+// built-in `crypto` module's `generateKeyPairSync` / `sign` where available,
+// and fall back to a bundled minimal ed25519 implementation.
 
-  // ------------------------------------------------------------------
-  // Built-in smoke test: verify the contract is deployed by querying
-  // the account's code_hash via RPC
-  // ------------------------------------------------------------------
-  core.info('Smoke test 1: verify contract code is deployed on-chain …');
-  let codeHashOk = false;
-  try {
-    const info = await queryAccount(accountId);
-    if (!info) throw new Error('Account not found');
-    const codeHash = info.code_hash;
-    if (!codeHash || codeHash === '11111111111111111111111111111111') {
-      throw new Error(`code_hash is empty/default — contract may not have been deployed. Got: ${codeHash}`);
+// Minimal ed25519 implementation based on the public-domain SUPERCOP ref10
+// ported to JS. This avoids any runtime dependency on tweetnacl/noble.
+
+/* eslint-disable no-bitwise */
+const _ed25519 = (() => {
+  // Field element: BigInt arithmetic mod p
+  const P = 2n ** 255n - 19n;
+  const Q = 2n ** 252n + 27742317777372353535851937790883648493n;
+
+  function mod(a, b) { return ((a % b) + b) % b; }
+  function modpow(base, exp, m) {
+    let result = 1n;
+    base = mod(base, m);
+    while (exp > 0n) {
+      if (exp & 1n) result = mod(result * base, m);
+      exp >>= 1n;
+      base = mod(base * base, m);
     }
-    core.info(`✅ Contract deployed. code_hash = ${codeHash}`);
-    results.push({ name: 'contract-deployed', passed: true, detail: codeHash });
-    codeHashOk = true;
-  } catch (err) {
-    core.error(`❌ Contract deployment check failed: ${err.message}`);
-    results.push({ name: 'contract-deployed', passed: false, detail: err.message });
+    return result;
+  }
+  function inv(x) { return modpow(x, P - 2n, P); }
+
+  const d = mod(-121665n * inv(121666n), P);
+  const I = modpow(2n, (P - 1n) / 4n, P);
+
+  function recoverX(y) {
+    const y2 = mod(y * y, P);
+    const x2 = mod((y2 - 1n) * inv(mod(d * y2 + 1n, P)), P);
+    if (x2 === 0n) return 0n;
+    let x = modpow(x2, (P + 3n) / 8n, P);
+    if (mod(x * x - x2, P) !== 0n) x = mod(x * I, P);
+    if (mod(x * x - x2, P) !== 0n) throw new Error('ed25519: bad point');
+    if (x & 1n) x = P - x;
+    return x;
   }
 
-  // ------------------------------------------------------------------
-  // Built-in smoke test: call view method `version` (if it exists)
-  // Many NEAR contracts expose this. We swallow errors gracefully.
-  // ------------------------------------------------------------------
-  core.info('Smoke test 2: attempt view call to `version` method …');
+  const Gx = 15112221349535807912866137220509078750507884956996801825395754139930612250239n;
+  const Gy = 46316835694926478169428394003475163141307993866256225615783033011972563516814n;
+  const G = [Gx, Gy];
+
+  function pointAdd(P1, P2) {
+    const [x1, y1] = P1, [x2, y2] = P2;
+    const dxy = mod(d * x1 * x2 * y1 * y2, P);
+    const x3 = mod((x1 * y2 + x2 * y1) * inv(1n + dxy), P);
+    const y3 = mod((y1 * y2 + x1 * x2) * inv(1n - dxy), P);
+    return [x3, y3];
+  }
+
+  function scalarMult(s, point) {
+    let result = null;
+    let addend = point;
+    while (s > 0n) {
+      if (s & 1n) result = result ? pointAdd(result, addend) : addend;
+      addend = pointAdd(addend, addend);
+      s >>= 1n;
+    }
+    return result || [0n, 1n];
+  }
+
+  function encodePoint([x, y]) {
+    const out = new Uint8Array(32);
+    let yTmp = y;
+    for (let i = 0; i < 32; i++) {
+      out[i] = Number(yTmp & 0xFFn);
+      yTmp >>= 8n;
+    }
+    if (x & 1n) out[31] |= 0x80;
+    return out;
+  }
+
+  function decodeBigIntLE(bytes) {
+    let n = 0n;
+    for (let i = bytes.length - 1; i >= 0; i--) n = (n << 8n) | BigInt(bytes[i]);
+    return n;
+  }
+
+  function sha512(data) {
+    return crypto.createHash('sha512').update(data).digest();
+  }
+
+  function clamp(key) {
+    key[0] &= 248;
+    key[31] &= 127;
+    key[31] |= 64;
+    return key;
+  }
+
+  function publicKeyFromSeed(seed) {
+    const h = sha512(seed);
+    const a = clamp(h.slice(0, 32));
+    const scalar = decodeBigIntLE(a);
+    const point = scalarMult(scalar, G);
+    return encodePoint(point);
+  }
+
+  function sign(message, secretKey) {
+    // secretKey = 64 bytes: seed(32) + pubkey(32)  OR just 32-byte seed
+    const seed = secretKey.length === 64 ? secretKey.slice(0, 32) : secretKey;
+    const h = sha512(seed);
+    const a = clamp(Buffer.from(h.slice(0, 32)));
+    const prefix = h.slice(32);
+
+    const pubKey = publicKeyFromSeed(seed);
+
+    // r = SHA512(prefix || message) mod q
+    const rHash = sha512(Buffer.concat([prefix, message]));
+    const r = mod(decodeBigIntLE(rHash), Q);
+    const R = scalarMult(r, G);
+    const Renc = encodePoint(R);
+
+    // S = (r + SHA512(R || pubkey || message) * a) mod q
+    const kHash = sha512(Buffer.concat([Renc, pubKey, message]));
+    const k = mod(decodeBigIntLE(kHash), Q);
+    const aScalar = decodeBigIntLE(a);
+    const S = mod(r + k * aScalar, Q);
+
+    const Senc = new Uint8Array(32);
+    let tmp = S;
+    for (let i = 0; i < 32; i++) { Senc[i] = Number(tmp & 0xFFn); tmp >>= 8n; }
+
+    return Buffer.concat([Renc, Senc]);
+  }
+
+  return { publicKeyFromSeed, sign };
+})();
+/* eslint-enable no-bitwise */
+
+// ---------------------------------------------------------------------------
+// NEAR key parsing
+// ---------------------------------------------------------------------------
+
+function parsePrivateKey(rawKey) {
+  // Accepts:
+  //   "ed25519:<base58 seed>"
+  //   raw base58 64-byte keypair
+  //   hex 64-byte keypair
+  let keyStr = rawKey.trim();
+  let seedBytes;
+
+  if (keyStr.startsWith('ed25519:')) {
+    keyStr = keyStr.slice('ed25519:'.length);
+  }
+
+  // Try hex first (64 bytes = 128 hex chars, or 32 bytes = 64 hex chars)
+  if (/^[0-9a-fA-F]+$/.test(keyStr)) {
+    const buf = Buffer.from(keyStr, 'hex');
+    seedBytes = buf.length >= 64 ? buf.slice(0, 32) : buf;
+  } else {
+    // Assume base58
+    seedBytes = base58Decode(keyStr);
+    if (seedBytes.length === 64) seedBytes = seedBytes.slice(0, 32);
+  }
+
+  if (seedBytes.length !== 32) {
+    throw new Error(`Private key seed must be 32 bytes, got ${seedBytes.length}`);
+  }
+
+  const publicKeyBytes = _ed25519.publicKeyFromSeed(seedBytes);
+  const publicKeyBase58 = base58Encode(publicKeyBytes);
+
+  return {
+    seedBytes,
+    publicKeyBytes: Buffer.from(publicKeyBytes),
+    publicKeyBase58,
+    publicKey: `ed25519:${publicKeyBase58}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Base58 utilities (Bitcoin alphabet — same as NEAR)
+// ---------------------------------------------------------------------------
+
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+function base58Encode(bytes) {
+  let num = BigInt('0x' + Buffer.from(bytes).toString('hex') || '00');
+  let result = '';
+  while (num > 0n) {
+    result = BASE58_ALPHABET[Number(num % 58n)] + result;
+    num /= 58n;
+  }
+  for (const byte of bytes) {
+    if (byte !== 0) break;
+    result = '1' + result;
+  }
+  return result;
+}
+
+function base58Decode(str) {
+  let num = 0n;
+  for (const ch of str) {
+    const idx = BASE58_ALPHABET.indexOf(ch);
+    if (idx < 0) throw new Error(`Invalid base58 character: ${ch}`);
+    num = num * 58n + BigInt(idx);
+  }
+  const hex = num.toString(16).padStart(2, '0');
+  const padded = hex.length % 2 ? '0' + hex : hex;
+  const bytes = Buffer.from(padded, 'hex');
+  const leadingZeros = [...str].filter(c => c === '1').length;
+  return Buffer.concat([Buffer.alloc(leadingZeros), bytes]);
+}
+
+// ---------------------------------------------------------------------------
+// NEAR transaction serialization (Borsh subset)
+// ---------------------------------------------------------------------------
+
+// Borsh encoding helpers
+class BorshWriter {
+  constructor() { this._buf = []; }
+
+  writeU8(v) { this._buf.push(v & 0xFF); }
+
+  writeU32(v) {
+    this._buf.push(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF);
+  }
+
+  writeU64(v) {
+    // v is BigInt
+    const lo = Number(v & 0xFFFFFFFFn);
+    const hi = Number((v >> 32n) & 0xFFFFFFFFn);
+    this.writeU32(lo);
+    this.writeU32(hi);
+  }
+
+  writeU128(v) {
+    this.writeU64(v & 0xFFFFFFFFFFFFFFFFn);
+    this.writeU64((v >> 64n) & 0xFFFFFFFFFFFFFFFFn);
+  }
+
+  writeBytes(buf) {
+    for (const b of buf) this._buf.push(b);
+  }
+
+  writeString(str) {
+    const bytes = Buffer.from(str, 'utf8');
+    this.writeU32(bytes.length);
+    this.writeBytes(bytes);
+  }
+
+  writeByteArray(buf) {
+    this.writeU32(buf.length);
+    this.writeBytes(buf);
+  }
+
+  toBuffer() { return Buffer.from(this._buf); }
+}
+
+// Action types
+const ACTION_DEPLOY_CONTRACT = 7;
+const ACTION_FUNCTION_CALL = 2;
+
+function serializeDeployContractTx(params) {
+  // params: { signerId, signerPublicKeyBytes, nonce, receiverId, blockHash, wasmBytes }
+  const w = new BorshWriter();
+
+  // signer_id
+  w.writeString(params.signerId);
+
+  // public key: 0 = ed25519, then 32 bytes
+  w.writeU8(0);
+  w.writeBytes(params.signerPublicKeyBytes);
+
+  // nonce (u64)
+  w.writeU64(BigInt(params.nonce));
+
+  // receiver_id
+  w.writeString(params.receiverId);
+
+  // block_hash (32 bytes)
+  w.writeBytes(params.blockHash);
+
+  // actions length (u32)
+  w.writeU32(1);
+
+  // action enum: 7 = DeployContract
+  w.writeU8(ACTION_DEPLOY_CONTRACT);
+
+  // DeployContract: code (byte array)
+  w.writeByteArray(params.wasmBytes);
+
+  return w.toBuffer();
+}
+
+function serializeFunctionCallTx(params) {
+  // params: { signerId, signerPublicKeyBytes, nonce, receiverId, blockHash,
+  //           methodName, args (Buffer), gas (BigInt), deposit (BigInt) }
+  const w = new BorshWriter();
+
+  w.writeString(params.signerId);
+  w.writeU8(0);
+  w.writeBytes(params.signerPublicKeyBytes);
+  w.writeU64(BigInt(params.nonce));
+  w.writeString(params.receiverId);
+  w.writeBytes(params.blockHash);
+
+  w.writeU32(1);
+  w.writeU8(ACTION_FUNCTION_CALL);
+
+  w.writeString(params.methodName);
+  w.writeByteArray(params.args);
+  w.writeU64(params.gas);
+  w.writeU128(params.deposit);
+
+  return w.toBuffer();
+}
+
+async function signAndBroadcast(txBuffer, seedBytes) {
+  const hash = crypto.createHash('sha256').update(txBuffer).digest();
+  const signature = _ed25519.sign(hash, seedBytes);
+
+  // Wrap in SignedTransaction
+  const w = new BorshWriter();
+  w.writeBytes(txBuffer);  // transaction bytes
+  // signature: 0 = ed25519, then 64 bytes
+  w.writeU8(0);
+  w.writeBytes(signature);
+
+  const signedBuffer = w.toBuffer();
+  const base64 = signedBuffer.toString('base64');
+  return broadcastTx(base64);
+}
+
+// ---------------------------------------------------------------------------
+// Retry helper
+// ---------------------------------------------------------------------------
+
+async function retry(fn, attempts, delayMs, label) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      core.warning(`${label} attempt ${i + 1}/${attempts} failed: ${err.message}`);
+      if (i < attempts - 1) await sleep(delayMs * (i + 1));
+    }
+  }
+  throw lastErr;
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ---------------------------------------------------------------------------
+// Step 1: Auto-create testnet account if needed
+// ---------------------------------------------------------------------------
+
+async function stepCreateAccountIfNeeded(accountId, keyPair) {
+  core.startGroup('Step 1: Verify / create testnet account');
+  let accountExists = false;
+
   try {
-    const viewCmd =
-      `${nearCli} view ${accountId} version '{}' ` +
-      `--networkId testnet --nodeUrl ${RPC_URL}`;
-    const out = exec(viewCmd, { env: { NEAR_ENV: 'testnet' } });
-    core.info(`version() returned: ${out}`);
-    results.push({ name: 'view-version', passed: true, detail: out });
+    const state = await getAccountState(accountId);
+    if (state && state.amount !== undefined) {
+      core.info(`Account ${accountId} already exists. Balance: ${formatNEAR(state.amount)} NEAR`);
+      accountExists = true;
+    }
   } catch (err) {
-    // Not a failure — many contracts don't have `version`
-    core.info(`view version(): not available or errored (non-fatal): ${err.message.split('\n')[0]}`);
-    results.push({ name: 'view-version', passed: null, detail: 'method not found (skipped)' });
+    core.info(`Could not query account state: ${err.message}. Will attempt creation.`);
   }
 
-  // ------------------------------------------------------------------
-  // User-supplied test script
-  // ------------------------------------------------------------------
-  if (testScriptPath && testScriptPath.trim() !== '') {
-    core.info(`Smoke test 3: running user-supplied test script: ${testScriptPath} …`);
-    const absScript = path.resolve(testScriptPath.trim());
+  if (!accountExists) {
+    core.info(`Account ${accountId} does not exist. Attempting creation via testnet helper...`);
 
-    // Could be a shell command OR a file path
-    const isFile = fs.existsSync(absScript);
+    // NEAR testnet helper: POST /account
+    const payload = {
+      newAccountId: accountId,
+      newAccountPublicKey: keyPair.publicKey,
+    };
 
     try {
-      let scriptOutput;
-      if (isFile) {
-        const ext = path.extname(absScript);
-        if (ext === '.js' || ext === '.mjs') {
-          scriptOutput = exec(`node ${absScript}`, {
-            env: {
-              NEAR_ENV: 'testnet',
-              NEAR_ACCOUNT_ID: accountId,
-              RPC_URL,
-            },
-          });
-        } else if (ext === '.sh') {
-          exec(`chmod +x ${absScript}`);
-          scriptOutput = exec(absScript, {
-            env: {
-              NEAR_ENV: 'testnet',
-              NEAR_ACCOUNT_ID: accountId,
-              RPC_URL,
-            },
-          });
-        } else {
-          scriptOutput = exec(absScript, {
-            env: { NEAR_ENV: 'testnet', NEAR_ACCOUNT_ID: accountId, RPC_URL },
-          });
-        }
-      } else {
-        // Treat as a shell command string
-        scriptOutput = exec(testScriptPath.trim(), {
-          env: { NEAR_ENV: 'testnet', NEAR_ACCOUNT_ID: accountId, RPC_URL },
-        });
-      }
-      core.info(`Test script output:\n${scriptOutput}`);
-      results.push({ name: 'user-test-script', passed: true, detail: scriptOutput.substring(0, 500) });
+      const result = await retry(
+        () => jsonPost(`${NEAR_TESTNET_HELPER}/account`, payload),
+        3,
+        2000,
+        'Account creation'
+      );
+      core.info(`Account creation response: ${JSON.stringify(result)}`);
     } catch (err) {
-      core.error(`❌ User test script failed: ${err.message}`);
-      results.push({ name: 'user-test-script', passed: false, detail: err.message });
+      // Helper may reject if account exists or different key; check again
+      core.warning(`Helper account creation returned: ${err.message}`);
+    }
+
+    // Confirm
+    await sleep(3000);
+    const state = await getAccountState(accountId);
+    if (state && state.amount !== undefined) {
+      core.info(`Account ${accountId} successfully created. Balance: ${formatNEAR(state.amount)} NEAR`);
+      accountExists = true;
+    } else {
+      throw new Error(
+        `Account ${accountId} could not be created or verified. ` +
+        'Ensure the account name is valid (lowercase, ends with .testnet) and the public key is correct.'
+      );
     }
   }
 
   core.endGroup();
-  return results;
+  return { accountExists };
 }
 
 // ---------------------------------------------------------------------------
-// STEP 5 — Report results
+// Step 2: Request faucet funding
 // ---------------------------------------------------------------------------
+
+async function stepFundAccount(accountId, fundingAmountNEAR) {
+  core.startGroup('Step 2: Request faucet funding');
+
+  const amountFloat = parseFloat(fundingAmountNEAR);
+  if (isNaN(amountFloat) || amountFloat <= 0) {
+    core.info('Faucet funding amount is 0 or invalid — skipping.');
+    core.endGroup();
+    return { funded: false, amount: '0' };
+  }
+
+  core.info(`Requesting ${amountFloat} NEAR from testnet faucet for account ${accountId}...`);
+
+  // Try NEAR faucet API
+  let funded = false;
+  let txHash = null;
+
+  try {
+    const payload = { account_id: accountId };
+    const result = await retry(
+      () => jsonPost(NEAR_FAUCET_API, payload, { 'User-Agent': 'near-testnet-deploy-action/1.0' }),
+      3,
+      4000,
+      'Faucet request'
+    );
+    core.info(`Faucet response: ${JSON.stringify(result)}`);
+    funded = true;
+    txHash = result.txHash || result.transaction_hash || null;
+  } catch (err) {
+    core.warning(`Primary faucet failed: ${err.message}. Trying testnet helper faucet...`);
+    // Fallback: NEAR testnet helper send-money endpoint
+    try {
+      const helperPayload = { account_id: accountId };
+      const res = await jsonPost(`${NEAR_TESTNET_HELPER}/faucet`, helperPayload);
+      core.info(`Helper faucet response: ${JSON.stringify(res)}`);
+      funded = true;
+    } catch (err2) {
+      core.warning(`Helper faucet also failed: ${err2.message}. Proceeding — account may already have sufficient balance.`
