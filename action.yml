@@ -3,29 +3,29 @@ description: "## Overview Create a GitHub Action specifically for deploying to N
 
 inputs:
   contract_path:
-    description: "Path to the NEAR contract file or directory to deploy"
+    description: "Path to the contract directory or compiled WASM file to deploy"
     required: true
     default: ''
-  account_id:
-    description: "NEAR testnet account ID for deployment"
+  testnet_account_id:
+    description: "NEAR testnet account ID for deployment (will be created if needed)"
     required: true
     default: ''
-  private_key:
-    description: "Private key for NEAR testnet account authentication"
+  testnet_private_key:
+    description: "Private key for testnet account authentication"
     required: true
     default: ''
   faucet_amount:
-    description: "Amount of NEAR tokens to request from faucet in tokens"
+    description: "Amount of NEAR tokens to request from faucet (in NEAR)"
     required: false
-    default: '200'
+    default: '100'
   test_command:
-    description: "Command to run smoke tests after deployment"
+    description: "Command to execute for smoke tests after deployment"
     required: false
     default: 'npm test'
-  network:
-    description: "NEAR network to deploy to"
+  near_cli_version:
+    description: "Version of NEAR CLI to use for deployment"
     required: false
-    default: 'testnet'
+    default: 'latest'
 
 outputs:
   result:
@@ -49,8 +49,8 @@ runs:
       run: cd ${{ github.action_path }} && node src/index.js
       env:
         INPUT_CONTRACT_PATH: ${{ inputs.contract_path }}
-        INPUT_ACCOUNT_ID: ${{ inputs.account_id }}
-        INPUT_PRIVATE_KEY: ${{ inputs.private_key }}
+        INPUT_TESTNET_ACCOUNT_ID: ${{ inputs.testnet_account_id }}
+        INPUT_TESTNET_PRIVATE_KEY: ${{ inputs.testnet_private_key }}
         INPUT_FAUCET_AMOUNT: ${{ inputs.faucet_amount }}
         INPUT_TEST_COMMAND: ${{ inputs.test_command }}
-        INPUT_NETWORK: ${{ inputs.network }}
+        INPUT_NEAR_CLI_VERSION: ${{ inputs.near_cli_version }}
