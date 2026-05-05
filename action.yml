@@ -3,29 +3,29 @@ description: "## Overview Create a GitHub Action specifically for deploying to N
 
 inputs:
   contract_path:
-    description: "Path to the contract file or directory to deploy"
+    description: "Path to the NEAR contract directory or compiled WASM file"
     required: true
     default: ''
-  account_id:
+  testnet_account_id:
     description: "NEAR testnet account ID for deployment"
     required: true
     default: ''
-  private_key:
+  testnet_private_key:
     description: "Private key for testnet account authentication"
     required: true
     default: ''
-  faucet_url:
-    description: "NEAR testnet faucet URL for funding"
+  faucet_funding_amount:
+    description: "Amount of NEAR tokens to request from faucet in tokens"
     required: false
-    default: 'https://helper.testnet.near.org/account'
-  test_command:
-    description: "Command to run smoke tests after deployment"
+    default: '10'
+  smoke_tests_path:
+    description: "Path to smoke test files to execute after deployment"
     required: false
-    default: 'npm test'
-  network:
-    description: "NEAR network to deploy to"
+    default: 'tests/'
+  auto_create_account:
+    description: "Automatically create testnet account if it doesn't exist"
     required: false
-    default: 'testnet'
+    default: 'true'
 
 outputs:
   result:
@@ -49,8 +49,8 @@ runs:
       run: cd ${{ github.action_path }} && node src/index.js
       env:
         INPUT_CONTRACT_PATH: ${{ inputs.contract_path }}
-        INPUT_ACCOUNT_ID: ${{ inputs.account_id }}
-        INPUT_PRIVATE_KEY: ${{ inputs.private_key }}
-        INPUT_FAUCET_URL: ${{ inputs.faucet_url }}
-        INPUT_TEST_COMMAND: ${{ inputs.test_command }}
-        INPUT_NETWORK: ${{ inputs.network }}
+        INPUT_TESTNET_ACCOUNT_ID: ${{ inputs.testnet_account_id }}
+        INPUT_TESTNET_PRIVATE_KEY: ${{ inputs.testnet_private_key }}
+        INPUT_FAUCET_FUNDING_AMOUNT: ${{ inputs.faucet_funding_amount }}
+        INPUT_SMOKE_TESTS_PATH: ${{ inputs.smoke_tests_path }}
+        INPUT_AUTO_CREATE_ACCOUNT: ${{ inputs.auto_create_account }}
