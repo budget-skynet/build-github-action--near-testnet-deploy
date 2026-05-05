@@ -1,545 +1,487 @@
-async function jsonPost(urlStr, payload, extraHeaders) {
-  const body = JSON.stringify(payload);
-  const headers = Object.assign(
-    { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    extraHeaders || {}
-  );
-  const res = await httpsRequest(urlStr, { method: 'POST', headers }, body);
-  if (res.statusCode < 200 || res.statusCode >= 300) {
-    throw new Error(`HTTP ${res.statusCode} from ${urlStr}: ${res.body}`);
+async function nearRpcCall(nodeUrl, method, params) {
+  const payload = {
+    jsonrpc: '2.0',
+    id: 'dontcare',
+    method,
+    params,
+  };
+  const response = await jsonPost(nodeUrl, payload);
+  const parsed = JSON.parse(response.body);
+  if (parsed.error) {
+    throw new Error(`RPC error (${method}): ${JSON.stringify(parsed.error)}`);
   }
+  return parsed.result;
+}
+
+// ─── Shell helpers ────────────────────────────────────────────────────────────
+
+function run_cmd(command, options = {}) {
+  core.info(`  $ ${command}`);
   try {
-    return JSON.parse(res.body);
-  } catch {
-    return res.body;
+    const output = execSync(command, {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ...options.env },
+      cwd: options.cwd || process.cwd(),
+      timeout: options.timeout || 300000,
+    });
+    if (output && output.trim()) core.info(output.trim());
+    return output.trim();
+  } catch (err) {
+    const stderr = err.stderr ? err.stderr.toString().trim() : '';
+    const stdout = err.stdout ? err.stdout.toString().trim() : '';
+    if (stdout) core.info(stdout);
+    if (stderr) core.error(stderr);
+    throw new Error(`Command failed: ${command}\n${stderr || stdout}`);
   }
 }
 
-async function jsonGet(urlStr, extraHeaders) {
-  const res = await httpsRequest(urlStr, { method: 'GET', headers: extraHeaders || {} });
-  if (res.statusCode < 200 || res.statusCode >= 300) {
-    throw new Error(`HTTP ${res.statusCode} from ${urlStr}: ${res.body}`);
-  }
+function run_cmd_result(command, options = {}) {
   try {
-    return JSON.parse(res.body);
-  } catch {
-    return res.body;
+    const output = execSync(command, {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ...options.env },
+      cwd: options.cwd || process.cwd(),
+      timeout: options.timeout || 300000,
+    });
+    return { success: true, stdout: output.trim(), stderr: '' };
+  } catch (err) {
+    return {
+      success: false,
+      stdout: err.stdout ? err.stdout.toString().trim() : '',
+      stderr: err.stderr ? err.stderr.toString().trim() : '',
+      code: err.status,
+    };
   }
 }
 
-// ---------------------------------------------------------------------------
-// NEAR RPC helpers
-// ---------------------------------------------------------------------------
-
-const NEAR_TESTNET_RPC = 'https://rpc.testnet.near.org';
-const NEAR_TESTNET_HELPER = 'https://helper.testnet.near.org';
-const NEAR_FAUCET_API = 'https://near-faucet.io/api/faucet/tokens';
-
-async function nearRpcCall(method, params) {
-  const payload = { jsonrpc: '2.0', id: 'dontcare', method, params };
-  const result = await jsonPost(NEAR_TESTNET_RPC, payload);
-  if (result.error) {
-    throw new Error(`NEAR RPC error [${method}]: ${JSON.stringify(result.error)}`);
-  }
-  return result.result;
+function toolExists(tool) {
+  const result = run_cmd_result(`which ${tool}`);
+  return result.success;
 }
 
-async function getAccountState(accountId) {
+// ─── NEAR credential helpers ──────────────────────────────────────────────────
+
+function getNearNodeUrl(network) {
+  const urls = {
+    testnet: 'https://rpc.testnet.near.org',
+    mainnet: 'https://rpc.mainnet.near.org',
+    betanet: 'https://rpc.betanet.near.org',
+  };
+  return urls[network] || urls.testnet;
+}
+
+function writeCredentials(accountId, privateKey, network) {
+  const homeDir = os.homedir();
+  const credDir = path.join(homeDir, '.near-credentials', network);
+  fs.mkdirSync(credDir, { recursive: true });
+
+  // Derive public key from private key using near-cli if available,
+  // otherwise store what we have and rely on near-cli's key lookup.
+  let publicKey = '';
+  if (privateKey.startsWith('ed25519:')) {
+    // Try to parse the public key portion; if we can't derive it, store a
+    // placeholder – near-cli will use the full key material correctly.
+    try {
+      const { KeyPair } = require('near-api-js');
+      const keyPair = KeyPair.fromString(privateKey);
+      publicKey = keyPair.getPublicKey().toString();
+    } catch (_) {
+      publicKey = 'ed25519:' + Buffer.from(privateKey.replace('ed25519:', ''), 'base64').toString('hex').slice(0, 44);
+    }
+  }
+
+  const credData = {
+    account_id: accountId,
+    public_key: publicKey,
+    private_key: privateKey,
+  };
+
+  const credFile = path.join(credDir, `${accountId}.json`);
+  fs.writeFileSync(credFile, JSON.stringify(credData, null, 2), { mode: 0o600 });
+  core.info(`Credentials written to ${credFile}`);
+  return credFile;
+}
+
+// ─── Step 1: Check / create testnet account ───────────────────────────────────
+
+async function stepCreateOrVerifyAccount(accountId, privateKey, network, faucetUrl) {
+  core.startGroup('Step 1 — Create / verify testnet account');
+
+  const nodeUrl = getNearNodeUrl(network);
+  core.info(`Checking account "${accountId}" on ${network} (${nodeUrl}) …`);
+
+  let accountExists = false;
   try {
-    const result = await nearRpcCall('query', {
+    const result = await nearRpcCall(nodeUrl, 'query', {
       request_type: 'view_account',
       finality: 'final',
       account_id: accountId,
     });
-    return result;
+    core.info(`Account found. Balance: ${(BigInt(result.amount) / BigInt(1e24)).toString()} NEAR`);
+    accountExists = true;
   } catch (err) {
-    if (err.message.includes('does not exist')) return null;
-    if (err.message.includes('UNKNOWN_ACCOUNT')) return null;
-    throw err;
-  }
-}
-
-async function getAccessKeyInfo(accountId, publicKey) {
-  try {
-    const result = await nearRpcCall('query', {
-      request_type: 'view_access_key',
-      finality: 'final',
-      account_id: accountId,
-      public_key: publicKey,
-    });
-    return result;
-  } catch (err) {
-    if (err.message.includes('does not exist')) return null;
-    throw err;
-  }
-}
-
-async function getLatestBlock() {
-  return nearRpcCall('block', { finality: 'final' });
-}
-
-async function broadcastTx(signedTxBase64) {
-  return nearRpcCall('broadcast_tx_commit', [signedTxBase64]);
-}
-
-async function queryContractCode(accountId) {
-  try {
-    return nearRpcCall('query', {
-      request_type: 'view_code',
-      finality: 'final',
-      account_id: accountId,
-    });
-  } catch {
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Key / signing utilities (pure Node.js — no external crypto deps)
-// ---------------------------------------------------------------------------
-
-// NEAR uses ed25519. Node 15+ has webcrypto; for compatibility we use the
-// built-in `crypto` module's `generateKeyPairSync` / `sign` where available,
-// and fall back to a bundled minimal ed25519 implementation.
-
-// Minimal ed25519 implementation based on the public-domain SUPERCOP ref10
-// ported to JS. This avoids any runtime dependency on tweetnacl/noble.
-
-/* eslint-disable no-bitwise */
-const _ed25519 = (() => {
-  // Field element: BigInt arithmetic mod p
-  const P = 2n ** 255n - 19n;
-  const Q = 2n ** 252n + 27742317777372353535851937790883648493n;
-
-  function mod(a, b) { return ((a % b) + b) % b; }
-  function modpow(base, exp, m) {
-    let result = 1n;
-    base = mod(base, m);
-    while (exp > 0n) {
-      if (exp & 1n) result = mod(result * base, m);
-      exp >>= 1n;
-      base = mod(base * base, m);
+    if (err.message.includes('does not exist') || err.message.includes('UnknownAccount')) {
+      core.info(`Account "${accountId}" does not exist yet — will create it.`);
+    } else {
+      core.warning(`RPC check failed (${err.message}) — proceeding with creation attempt.`);
     }
-    return result;
-  }
-  function inv(x) { return modpow(x, P - 2n, P); }
-
-  const d = mod(-121665n * inv(121666n), P);
-  const I = modpow(2n, (P - 1n) / 4n, P);
-
-  function recoverX(y) {
-    const y2 = mod(y * y, P);
-    const x2 = mod((y2 - 1n) * inv(mod(d * y2 + 1n, P)), P);
-    if (x2 === 0n) return 0n;
-    let x = modpow(x2, (P + 3n) / 8n, P);
-    if (mod(x * x - x2, P) !== 0n) x = mod(x * I, P);
-    if (mod(x * x - x2, P) !== 0n) throw new Error('ed25519: bad point');
-    if (x & 1n) x = P - x;
-    return x;
-  }
-
-  const Gx = 15112221349535807912866137220509078750507884956996801825395754139930612250239n;
-  const Gy = 46316835694926478169428394003475163141307993866256225615783033011972563516814n;
-  const G = [Gx, Gy];
-
-  function pointAdd(P1, P2) {
-    const [x1, y1] = P1, [x2, y2] = P2;
-    const dxy = mod(d * x1 * x2 * y1 * y2, P);
-    const x3 = mod((x1 * y2 + x2 * y1) * inv(1n + dxy), P);
-    const y3 = mod((y1 * y2 + x1 * x2) * inv(1n - dxy), P);
-    return [x3, y3];
-  }
-
-  function scalarMult(s, point) {
-    let result = null;
-    let addend = point;
-    while (s > 0n) {
-      if (s & 1n) result = result ? pointAdd(result, addend) : addend;
-      addend = pointAdd(addend, addend);
-      s >>= 1n;
-    }
-    return result || [0n, 1n];
-  }
-
-  function encodePoint([x, y]) {
-    const out = new Uint8Array(32);
-    let yTmp = y;
-    for (let i = 0; i < 32; i++) {
-      out[i] = Number(yTmp & 0xFFn);
-      yTmp >>= 8n;
-    }
-    if (x & 1n) out[31] |= 0x80;
-    return out;
-  }
-
-  function decodeBigIntLE(bytes) {
-    let n = 0n;
-    for (let i = bytes.length - 1; i >= 0; i--) n = (n << 8n) | BigInt(bytes[i]);
-    return n;
-  }
-
-  function sha512(data) {
-    return crypto.createHash('sha512').update(data).digest();
-  }
-
-  function clamp(key) {
-    key[0] &= 248;
-    key[31] &= 127;
-    key[31] |= 64;
-    return key;
-  }
-
-  function publicKeyFromSeed(seed) {
-    const h = sha512(seed);
-    const a = clamp(h.slice(0, 32));
-    const scalar = decodeBigIntLE(a);
-    const point = scalarMult(scalar, G);
-    return encodePoint(point);
-  }
-
-  function sign(message, secretKey) {
-    // secretKey = 64 bytes: seed(32) + pubkey(32)  OR just 32-byte seed
-    const seed = secretKey.length === 64 ? secretKey.slice(0, 32) : secretKey;
-    const h = sha512(seed);
-    const a = clamp(Buffer.from(h.slice(0, 32)));
-    const prefix = h.slice(32);
-
-    const pubKey = publicKeyFromSeed(seed);
-
-    // r = SHA512(prefix || message) mod q
-    const rHash = sha512(Buffer.concat([prefix, message]));
-    const r = mod(decodeBigIntLE(rHash), Q);
-    const R = scalarMult(r, G);
-    const Renc = encodePoint(R);
-
-    // S = (r + SHA512(R || pubkey || message) * a) mod q
-    const kHash = sha512(Buffer.concat([Renc, pubKey, message]));
-    const k = mod(decodeBigIntLE(kHash), Q);
-    const aScalar = decodeBigIntLE(a);
-    const S = mod(r + k * aScalar, Q);
-
-    const Senc = new Uint8Array(32);
-    let tmp = S;
-    for (let i = 0; i < 32; i++) { Senc[i] = Number(tmp & 0xFFn); tmp >>= 8n; }
-
-    return Buffer.concat([Renc, Senc]);
-  }
-
-  return { publicKeyFromSeed, sign };
-})();
-/* eslint-enable no-bitwise */
-
-// ---------------------------------------------------------------------------
-// NEAR key parsing
-// ---------------------------------------------------------------------------
-
-function parsePrivateKey(rawKey) {
-  // Accepts:
-  //   "ed25519:<base58 seed>"
-  //   raw base58 64-byte keypair
-  //   hex 64-byte keypair
-  let keyStr = rawKey.trim();
-  let seedBytes;
-
-  if (keyStr.startsWith('ed25519:')) {
-    keyStr = keyStr.slice('ed25519:'.length);
-  }
-
-  // Try hex first (64 bytes = 128 hex chars, or 32 bytes = 64 hex chars)
-  if (/^[0-9a-fA-F]+$/.test(keyStr)) {
-    const buf = Buffer.from(keyStr, 'hex');
-    seedBytes = buf.length >= 64 ? buf.slice(0, 32) : buf;
-  } else {
-    // Assume base58
-    seedBytes = base58Decode(keyStr);
-    if (seedBytes.length === 64) seedBytes = seedBytes.slice(0, 32);
-  }
-
-  if (seedBytes.length !== 32) {
-    throw new Error(`Private key seed must be 32 bytes, got ${seedBytes.length}`);
-  }
-
-  const publicKeyBytes = _ed25519.publicKeyFromSeed(seedBytes);
-  const publicKeyBase58 = base58Encode(publicKeyBytes);
-
-  return {
-    seedBytes,
-    publicKeyBytes: Buffer.from(publicKeyBytes),
-    publicKeyBase58,
-    publicKey: `ed25519:${publicKeyBase58}`,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Base58 utilities (Bitcoin alphabet — same as NEAR)
-// ---------------------------------------------------------------------------
-
-const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-
-function base58Encode(bytes) {
-  let num = BigInt('0x' + Buffer.from(bytes).toString('hex') || '00');
-  let result = '';
-  while (num > 0n) {
-    result = BASE58_ALPHABET[Number(num % 58n)] + result;
-    num /= 58n;
-  }
-  for (const byte of bytes) {
-    if (byte !== 0) break;
-    result = '1' + result;
-  }
-  return result;
-}
-
-function base58Decode(str) {
-  let num = 0n;
-  for (const ch of str) {
-    const idx = BASE58_ALPHABET.indexOf(ch);
-    if (idx < 0) throw new Error(`Invalid base58 character: ${ch}`);
-    num = num * 58n + BigInt(idx);
-  }
-  const hex = num.toString(16).padStart(2, '0');
-  const padded = hex.length % 2 ? '0' + hex : hex;
-  const bytes = Buffer.from(padded, 'hex');
-  const leadingZeros = [...str].filter(c => c === '1').length;
-  return Buffer.concat([Buffer.alloc(leadingZeros), bytes]);
-}
-
-// ---------------------------------------------------------------------------
-// NEAR transaction serialization (Borsh subset)
-// ---------------------------------------------------------------------------
-
-// Borsh encoding helpers
-class BorshWriter {
-  constructor() { this._buf = []; }
-
-  writeU8(v) { this._buf.push(v & 0xFF); }
-
-  writeU32(v) {
-    this._buf.push(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF);
-  }
-
-  writeU64(v) {
-    // v is BigInt
-    const lo = Number(v & 0xFFFFFFFFn);
-    const hi = Number((v >> 32n) & 0xFFFFFFFFn);
-    this.writeU32(lo);
-    this.writeU32(hi);
-  }
-
-  writeU128(v) {
-    this.writeU64(v & 0xFFFFFFFFFFFFFFFFn);
-    this.writeU64((v >> 64n) & 0xFFFFFFFFFFFFFFFFn);
-  }
-
-  writeBytes(buf) {
-    for (const b of buf) this._buf.push(b);
-  }
-
-  writeString(str) {
-    const bytes = Buffer.from(str, 'utf8');
-    this.writeU32(bytes.length);
-    this.writeBytes(bytes);
-  }
-
-  writeByteArray(buf) {
-    this.writeU32(buf.length);
-    this.writeBytes(buf);
-  }
-
-  toBuffer() { return Buffer.from(this._buf); }
-}
-
-// Action types
-const ACTION_DEPLOY_CONTRACT = 7;
-const ACTION_FUNCTION_CALL = 2;
-
-function serializeDeployContractTx(params) {
-  // params: { signerId, signerPublicKeyBytes, nonce, receiverId, blockHash, wasmBytes }
-  const w = new BorshWriter();
-
-  // signer_id
-  w.writeString(params.signerId);
-
-  // public key: 0 = ed25519, then 32 bytes
-  w.writeU8(0);
-  w.writeBytes(params.signerPublicKeyBytes);
-
-  // nonce (u64)
-  w.writeU64(BigInt(params.nonce));
-
-  // receiver_id
-  w.writeString(params.receiverId);
-
-  // block_hash (32 bytes)
-  w.writeBytes(params.blockHash);
-
-  // actions length (u32)
-  w.writeU32(1);
-
-  // action enum: 7 = DeployContract
-  w.writeU8(ACTION_DEPLOY_CONTRACT);
-
-  // DeployContract: code (byte array)
-  w.writeByteArray(params.wasmBytes);
-
-  return w.toBuffer();
-}
-
-function serializeFunctionCallTx(params) {
-  // params: { signerId, signerPublicKeyBytes, nonce, receiverId, blockHash,
-  //           methodName, args (Buffer), gas (BigInt), deposit (BigInt) }
-  const w = new BorshWriter();
-
-  w.writeString(params.signerId);
-  w.writeU8(0);
-  w.writeBytes(params.signerPublicKeyBytes);
-  w.writeU64(BigInt(params.nonce));
-  w.writeString(params.receiverId);
-  w.writeBytes(params.blockHash);
-
-  w.writeU32(1);
-  w.writeU8(ACTION_FUNCTION_CALL);
-
-  w.writeString(params.methodName);
-  w.writeByteArray(params.args);
-  w.writeU64(params.gas);
-  w.writeU128(params.deposit);
-
-  return w.toBuffer();
-}
-
-async function signAndBroadcast(txBuffer, seedBytes) {
-  const hash = crypto.createHash('sha256').update(txBuffer).digest();
-  const signature = _ed25519.sign(hash, seedBytes);
-
-  // Wrap in SignedTransaction
-  const w = new BorshWriter();
-  w.writeBytes(txBuffer);  // transaction bytes
-  // signature: 0 = ed25519, then 64 bytes
-  w.writeU8(0);
-  w.writeBytes(signature);
-
-  const signedBuffer = w.toBuffer();
-  const base64 = signedBuffer.toString('base64');
-  return broadcastTx(base64);
-}
-
-// ---------------------------------------------------------------------------
-// Retry helper
-// ---------------------------------------------------------------------------
-
-async function retry(fn, attempts, delayMs, label) {
-  let lastErr;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      core.warning(`${label} attempt ${i + 1}/${attempts} failed: ${err.message}`);
-      if (i < attempts - 1) await sleep(delayMs * (i + 1));
-    }
-  }
-  throw lastErr;
-}
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// ---------------------------------------------------------------------------
-// Step 1: Auto-create testnet account if needed
-// ---------------------------------------------------------------------------
-
-async function stepCreateAccountIfNeeded(accountId, keyPair) {
-  core.startGroup('Step 1: Verify / create testnet account');
-  let accountExists = false;
-
-  try {
-    const state = await getAccountState(accountId);
-    if (state && state.amount !== undefined) {
-      core.info(`Account ${accountId} already exists. Balance: ${formatNEAR(state.amount)} NEAR`);
-      accountExists = true;
-    }
-  } catch (err) {
-    core.info(`Could not query account state: ${err.message}. Will attempt creation.`);
   }
 
   if (!accountExists) {
-    core.info(`Account ${accountId} does not exist. Attempting creation via testnet helper...`);
+    core.info(`Requesting account creation from faucet: ${faucetUrl}`);
 
-    // NEAR testnet helper: POST /account
-    const payload = {
+    // Extract public key to send to faucet
+    let publicKey = privateKey;
+    try {
+      const nearApiJs = requireSafe('near-api-js');
+      if (nearApiJs) {
+        const keyPair = nearApiJs.KeyPair.fromString(privateKey);
+        publicKey = keyPair.getPublicKey().toString();
+      }
+    } catch (_) {}
+
+    const faucetPayload = {
       newAccountId: accountId,
-      newAccountPublicKey: keyPair.publicKey,
+      newAccountPublicKey: publicKey,
     };
 
     try {
-      const result = await retry(
-        () => jsonPost(`${NEAR_TESTNET_HELPER}/account`, payload),
-        3,
-        2000,
-        'Account creation'
-      );
-      core.info(`Account creation response: ${JSON.stringify(result)}`);
-    } catch (err) {
-      // Helper may reject if account exists or different key; check again
-      core.warning(`Helper account creation returned: ${err.message}`);
+      const resp = await jsonPost(faucetUrl, faucetPayload, {
+        'Accept': 'application/json',
+      });
+      core.info(`Faucet response [${resp.status}]: ${resp.body.slice(0, 500)}`);
+
+      if (resp.status >= 200 && resp.status < 300) {
+        core.info('Account creation request accepted by faucet.');
+      } else {
+        // Some helpers return 200 but with error text
+        if (resp.body.toLowerCase().includes('error')) {
+          core.warning(`Faucet may have returned an error: ${resp.body.slice(0, 200)}`);
+        }
+      }
+    } catch (faucetErr) {
+      // Try alternate faucet endpoint format
+      core.warning(`Primary faucet call failed: ${faucetErr.message}. Trying alternate endpoint …`);
+      const altUrl = faucetUrl.replace('/account', '') + '/create_account';
+      try {
+        const resp2 = await jsonPost(altUrl, faucetPayload);
+        core.info(`Alt faucet response [${resp2.status}]: ${resp2.body.slice(0, 200)}`);
+      } catch (altErr) {
+        core.warning(`Alt faucet also failed: ${altErr.message}. Will proceed — account may already exist or CLI will handle it.`);
+      }
     }
 
-    // Confirm
-    await sleep(3000);
-    const state = await getAccountState(accountId);
-    if (state && state.amount !== undefined) {
-      core.info(`Account ${accountId} successfully created. Balance: ${formatNEAR(state.amount)} NEAR`);
-      accountExists = true;
-    } else {
-      throw new Error(
-        `Account ${accountId} could not be created or verified. ` +
-        'Ensure the account name is valid (lowercase, ends with .testnet) and the public key is correct.'
-      );
+    // Wait for propagation
+    core.info('Waiting 8 s for account propagation …');
+    await sleep(8000);
+
+    // Confirm creation
+    let confirmed = false;
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      try {
+        const r = await nearRpcCall(nodeUrl, 'query', {
+          request_type: 'view_account',
+          finality: 'final',
+          account_id: accountId,
+        });
+        core.info(`Account confirmed on attempt ${attempt}. Balance: ${(BigInt(r.amount) / BigInt(1e24)).toString()} NEAR`);
+        confirmed = true;
+        break;
+      } catch (_) {
+        core.info(`Account not yet visible (attempt ${attempt}/6) — waiting 5 s …`);
+        await sleep(5000);
+      }
     }
+
+    if (!confirmed) {
+      throw new Error(`Account "${accountId}" could not be confirmed after faucet request. Check the faucet URL and account ID.`);
+    }
+  }
+
+  // Write credentials for near-cli
+  const credFile = writeCredentials(accountId, privateKey, network);
+
+  core.endGroup();
+  return { accountExists, credFile };
+}
+
+// ─── Step 2: Request faucet funding ──────────────────────────────────────────
+
+async function stepFaucetFunding(accountId, privateKey, network, faucetUrl) {
+  core.startGroup('Step 2 — Request faucet funding');
+
+  const nodeUrl = getNearNodeUrl(network);
+
+  // Check current balance
+  let balanceBefore = BigInt(0);
+  try {
+    const result = await nearRpcCall(nodeUrl, 'query', {
+      request_type: 'view_account',
+      finality: 'final',
+      account_id: accountId,
+    });
+    balanceBefore = BigInt(result.amount);
+    const nearBalance = Number(balanceBefore / BigInt(1e21)) / 1000;
+    core.info(`Balance before funding: ${nearBalance.toFixed(3)} NEAR`);
+
+    // If balance is already above 5 NEAR, skip faucet
+    if (balanceBefore >= BigInt(5) * BigInt(1e24)) {
+      core.info('Balance is sufficient (≥ 5 NEAR). Skipping faucet request.');
+      core.endGroup();
+      return { funded: false, skipped: true, balanceBefore };
+    }
+  } catch (err) {
+    core.warning(`Could not fetch balance: ${err.message}`);
+  }
+
+  core.info(`Requesting top-up from ${faucetUrl} …`);
+
+  let publicKey = privateKey;
+  try {
+    const nearApiJs = requireSafe('near-api-js');
+    if (nearApiJs) {
+      const keyPair = nearApiJs.KeyPair.fromString(privateKey);
+      publicKey = keyPair.getPublicKey().toString();
+    }
+  } catch (_) {}
+
+  // Some faucets accept GET with query params; others accept POST JSON
+  const payloads = [
+    { url: faucetUrl, method: 'POST', body: { newAccountId: accountId, newAccountPublicKey: publicKey } },
+    { url: `${faucetUrl}?account_id=${encodeURIComponent(accountId)}`, method: 'GET', body: null },
+  ];
+
+  let funded = false;
+  for (const attempt of payloads) {
+    try {
+      let resp;
+      if (attempt.method === 'POST') {
+        resp = await jsonPost(attempt.url, attempt.body);
+      } else {
+        resp = await httpRequest(attempt.url, { method: 'GET' });
+      }
+      core.info(`Faucet response [${resp.status}]: ${resp.body.slice(0, 300)}`);
+      if (resp.status >= 200 && resp.status < 300) {
+        funded = true;
+        break;
+      }
+    } catch (e) {
+      core.warning(`Faucet attempt failed: ${e.message}`);
+    }
+  }
+
+  if (funded) {
+    core.info('Faucet request sent. Waiting 10 s for funds to arrive …');
+    await sleep(10000);
+
+    try {
+      const result = await nearRpcCall(nodeUrl, 'query', {
+        request_type: 'view_account',
+        finality: 'final',
+        account_id: accountId,
+      });
+      const balanceAfter = BigInt(result.amount);
+      const nearBalance = Number(balanceAfter / BigInt(1e21)) / 1000;
+      core.info(`Balance after funding: ${nearBalance.toFixed(3)} NEAR`);
+    } catch (_) {}
+  } else {
+    core.warning('Could not confirm faucet funding. Proceeding — deploy may fail if balance is too low.');
   }
 
   core.endGroup();
-  return { accountExists };
+  return { funded, skipped: false, balanceBefore };
 }
 
-// ---------------------------------------------------------------------------
-// Step 2: Request faucet funding
-// ---------------------------------------------------------------------------
+// ─── Step 3: Build & deploy contract ─────────────────────────────────────────
 
-async function stepFundAccount(accountId, fundingAmountNEAR) {
-  core.startGroup('Step 2: Request faucet funding');
+async function stepDeployContract(contractPath, accountId, privateKey, network) {
+  core.startGroup('Step 3 — Build & deploy contract');
 
-  const amountFloat = parseFloat(fundingAmountNEAR);
-  if (isNaN(amountFloat) || amountFloat <= 0) {
-    core.info('Faucet funding amount is 0 or invalid — skipping.');
-    core.endGroup();
-    return { funded: false, amount: '0' };
+  const nodeUrl = getNearNodeUrl(network);
+  const resolvedPath = path.resolve(contractPath);
+
+  if (!fs.existsSync(resolvedPath)) {
+    throw new Error(`contract_path "${resolvedPath}" does not exist.`);
   }
 
-  core.info(`Requesting ${amountFloat} NEAR from testnet faucet for account ${accountId}...`);
+  const stat = fs.statSync(resolvedPath);
+  let wasmPath = null;
 
-  // Try NEAR faucet API
-  let funded = false;
+  // ── Determine if we have a pre-built .wasm or need to build ──────────────
+  if (stat.isFile() && resolvedPath.endsWith('.wasm')) {
+    wasmPath = resolvedPath;
+    core.info(`Pre-built WASM found: ${wasmPath}`);
+  } else {
+    // It's a directory — detect project type and build
+    const projectDir = stat.isDirectory() ? resolvedPath : path.dirname(resolvedPath);
+    core.info(`Building contract in ${projectDir} …`);
+    wasmPath = await buildContract(projectDir);
+  }
+
+  // ── Deploy via near-cli or near-api-js ────────────────────────────────────
+  const wasmSize = fs.statSync(wasmPath).size;
+  core.info(`Deploying ${wasmPath} (${(wasmSize / 1024).toFixed(1)} KB) to ${accountId} on ${network} …`);
+
+  // Try near-cli first (most reliable for deploying)
+  const nearCliResult = await deployWithNearCli(wasmPath, accountId, network, privateKey);
+
   let txHash = null;
 
-  try {
-    const payload = { account_id: accountId };
-    const result = await retry(
-      () => jsonPost(NEAR_FAUCET_API, payload, { 'User-Agent': 'near-testnet-deploy-action/1.0' }),
-      3,
-      4000,
-      'Faucet request'
-    );
-    core.info(`Faucet response: ${JSON.stringify(result)}`);
-    funded = true;
-    txHash = result.txHash || result.transaction_hash || null;
-  } catch (err) {
-    core.warning(`Primary faucet failed: ${err.message}. Trying testnet helper faucet...`);
-    // Fallback: NEAR testnet helper send-money endpoint
+  if (!nearCliResult.success) {
+    core.warning(`near-cli deploy failed: ${nearCliResult.error}. Falling back to near-api-js …`);
+    txHash = await deployWithNearApiJs(wasmPath, accountId, privateKey, nodeUrl);
+  } else {
+    txHash = nearCliResult.txHash;
+    core.info(`near-cli deploy succeeded. TX: ${nearCliResult.txHash || 'N/A'}`);
+  }
+
+  // ── Verify deployment ─────────────────────────────────────────────────────
+  core.info('Verifying deployment via RPC …');
+  await sleep(3000);
+
+  let deployConfirmed = false;
+  for (let i = 1; i <= 5; i++) {
     try {
-      const helperPayload = { account_id: accountId };
-      const res = await jsonPost(`${NEAR_TESTNET_HELPER}/faucet`, helperPayload);
-      core.info(`Helper faucet response: ${JSON.stringify(res)}`);
-      funded = true;
-    } catch (err2) {
-      core.warning(`Helper faucet also failed: ${err2.message}. Proceeding — account may already have sufficient balance.`
+      const result = await nearRpcCall(nodeUrl, 'query', {
+        request_type: 'view_code',
+        finality: 'final',
+        account_id: accountId,
+      });
+      if (result.code_base64 && result.code_base64.length > 10) {
+        const deployedSize = Buffer.from(result.code_base64, 'base64').length;
+        core.info(`Contract deployed and verified. On-chain size: ${(deployedSize / 1024).toFixed(1)} KB`);
+        deployConfirmed = true;
+        break;
+      }
+    } catch (err) {
+      core.info(`Verification attempt ${i}/5 failed: ${err.message}. Retrying in 4 s …`);
+      await sleep(4000);
+    }
+  }
+
+  if (!deployConfirmed) {
+    throw new Error('Contract deployment could not be verified via view_code RPC after 5 attempts.');
+  }
+
+  core.endGroup();
+  return { wasmPath, txHash, deployConfirmed };
+}
+
+async function buildContract(projectDir) {
+  const cargoToml = path.join(projectDir, 'Cargo.toml');
+  const packageJson = path.join(projectDir, 'package.json');
+  const assemblyscriptConfig = path.join(projectDir, 'asconfig.json');
+
+  if (fs.existsSync(cargoToml)) {
+    return buildRust(projectDir, cargoToml);
+  } else if (fs.existsSync(assemblyscriptConfig)) {
+    return buildAssemblyScript(projectDir);
+  } else if (fs.existsSync(packageJson)) {
+    return buildJavaScriptContract(projectDir);
+  } else {
+    throw new Error(`Cannot determine contract type in ${projectDir}. Expected Cargo.toml, asconfig.json, or package.json.`);
+  }
+}
+
+async function buildRust(projectDir, cargoToml) {
+  core.info('Detected Rust contract (Cargo.toml found).');
+
+  // Ensure wasm32 target
+  const rustupResult = run_cmd_result('rustup target list --installed');
+  if (!rustupResult.stdout.includes('wasm32-unknown-unknown')) {
+    core.info('Adding wasm32-unknown-unknown target …');
+    run_cmd('rustup target add wasm32-unknown-unknown');
+  }
+
+  // Check for near-sdk build script or just use cargo build
+  const buildScript = path.join(projectDir, 'build.sh');
+  if (fs.existsSync(buildScript)) {
+    core.info('Using project build.sh …');
+    run_cmd(`bash ${buildScript}`, { cwd: projectDir });
+  } else {
+    run_cmd(
+      'cargo build --target wasm32-unknown-unknown --release',
+      { cwd: projectDir }
+    );
+  }
+
+  // Locate the .wasm output
+  const wasmDir = path.join(projectDir, 'target', 'wasm32-unknown-unknown', 'release');
+  if (!fs.existsSync(wasmDir)) {
+    throw new Error(`Expected wasm output directory not found: ${wasmDir}`);
+  }
+
+  const wasmFiles = fs.readdirSync(wasmDir).filter((f) => f.endsWith('.wasm'));
+  if (wasmFiles.length === 0) {
+    throw new Error(`No .wasm file found in ${wasmDir} after build.`);
+  }
+
+  // Pick the largest .wasm (usually the main contract, not dependencies)
+  wasmFiles.sort((a, b) => {
+    return fs.statSync(path.join(wasmDir, b)).size - fs.statSync(path.join(wasmDir, a)).size;
+  });
+
+  const wasmPath = path.join(wasmDir, wasmFiles[0]);
+  core.info(`Built WASM: ${wasmPath} (${(fs.statSync(wasmPath).size / 1024).toFixed(1)} KB)`);
+  return wasmPath;
+}
+
+async function buildAssemblyScript(projectDir) {
+  core.info('Detected AssemblyScript contract (asconfig.json found).');
+
+  const pkgJson = path.join(projectDir, 'package.json');
+  if (fs.existsSync(pkgJson)) {
+    run_cmd('npm install', { cwd: projectDir });
+    const pkg = JSON.parse(fs.readFileSync(pkgJson, 'utf8'));
+    if (pkg.scripts && pkg.scripts.build) {
+      run_cmd('npm run build', { cwd: projectDir });
+    } else {
+      run_cmd('npx asc assembly/index.ts --target release', { cwd: projectDir });
+    }
+  } else {
+    run_cmd('npx asc assembly/index.ts --target release', { cwd: projectDir });
+  }
+
+  // Common output locations
+  const candidates = [
+    path.join(projectDir, 'build', 'release', 'contract.wasm'),
+    path.join(projectDir, 'build', 'contract.wasm'),
+    path.join(projectDir, 'out', 'main.wasm'),
+  ];
+
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+
+  // Search recursively
+  const found = findWasm(projectDir);
+  if (found) return found;
+
+  throw new Error('Could not locate compiled .wasm after AssemblyScript build.');
+}
+
+async function buildJavaScriptContract(projectDir) {
+  core.info('Detected JavaScript/TypeScript contract (package.json found).');
+
+  run_cmd('npm install', { cwd: projectDir });
+
+  const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8'));
+  if (pkg.scripts && pkg.scripts.build) {
+    run_cmd('npm run build', { cwd: projectDir });
+  } else {
+    // Try near-sdk-js build
+    run_cmd('npx near-sdk-js build', { cwd: projectDir });
+  }
+
+  const found = findWasm(projectDir);
+  if (found) return found;
+
+  throw new Error('Could not locate compiled .wasm after JS contract build.');
+}
+
+function findWasm(dir, depth = 0) {
+  if (depth > 6) return null;
+  const entries = fs.readdirSync(dir);
+  for (const entry of entries) {
